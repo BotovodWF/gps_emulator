@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Навигатор</string>
+    <string name="status_idle">Нажми на карту, чтобы переместиться</string>
+    <string name="btn_stop">Стоп</string>
+</resources>

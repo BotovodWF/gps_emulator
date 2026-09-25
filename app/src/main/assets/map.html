@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"/>
+<!--
+  Map surface for the picker.
+
+  Tiles are raster images from Yandex, drawn onto a canvas by hand rather than
+  through a mapping library — the app only needs pan, zoom and a tap handler, and
+  a self-contained renderer keeps the asset small and the coordinate maths visible.
+
+  Requests go to /tile?z=&x=&y=, which YandexTileProxy intercepts on the Kotlin
+  side. Fetching the CDN directly from here does not work: WebView blocks the
+  cross-origin image loads and reports nothing.
+-->
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+html, body { width:100%; height:100%; overflow:hidden; font-family:sans-serif; }
+#map { width:100%; height:100%; position:relative; touch-action:none; }
+canvas { display:block; width:100%; height:100%; }
+
+#hint {
+    position:absolute; top:12px; left:50%; transform:translateX(-50%);
+    background:rgba(0,0,0,.65); color:#fff; padding:7px 18px;
+    border-radius:20px; font-size:14px; z-index:9; pointer-events:none; white-space:nowrap;
+}
+#coords-pill {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(27,138,60,.92); color:#fff; padding:8px 22px;
+    border-radius:24px; font-size:15px; font-weight:bold; z-index:9;
+    pointer-events:none; white-space:nowrap; display:none;
+}
+#zoom-btns {
+    position:absolute; top:12px; left:12px; display:flex; flex-direction:column; z-index:9;
+}
+.zbtn {
+    width:34px; height:34px; background:#fff; border:1px solid #ccc;
+    font-size:22px; line-height:1; cursor:pointer; display:flex; align-items:center;
+    justify-content:center; user-select:none; color:#333;
+}
+.zbtn:first-child { border-radius:4px 4px 0 0; border-bottom:none; }
+.zbtn:last-child  { border-radius:0 0 4px 4px; }
+#attr {
+    position:absolute; bottom:2px; right:4px; font-size:10px; color:#444; z-index:9; pointer-events:none;
+}
+</style>
+</head>
+<body>
+<div id="map">
+  <canvas id="c"></canvas>
+  <div id="hint">👆 Нажми на карту для выбора точки</div>
+  <div id="coords-pill"></div>
+  <div id="zoom-btns">
+    <div class="zbtn" id="zin">+</div>
+    <div class="zbtn" id="zout">−</div>
+  </div>
+  <div id="attr">© Яндекс Карты</div>
+</div>
+
+<script>
+// ── Projection ─────────────────────────────────────────────────────────────
+//
+// Yandex serves tiles in ELLIPTICAL Mercator (EPSG:3395), not the spherical
+// Mercator (EPSG:3857) that Google and OSM use. The two differ by the eccentricity
+// term below, and the gap grows with latitude: at 53°N it reaches 0.18° of
+// latitude — about 20 km.
+//
+// This matters because the maths here decides which tile to draw and which
+// coordinate a tap corresponds to. With spherical formulas the map rendered a
+// place 20 km north of the coordinate it reported, so every point the user picked
+// teleported somewhere they had not chosen.
+
+var TILE = 256;
+var ECC  = 0.0818191908426;   // WGS84 eccentricity
+
+function lon2px(lon, z){ return (lon+180)/360*Math.pow(2,z)*TILE; }
+function px2lon(px, z){ return px/Math.pow(2,z)/TILE*360-180; }
+
+function lat2py(lat, z){
+    var phi = lat*Math.PI/180;
+    var es  = ECC*Math.sin(phi);
+    var m   = Math.log(Math.tan(Math.PI/4 + phi/2)) - ECC/2*Math.log((1+es)/(1-es));
+    return (1 - m/Math.PI)/2*Math.pow(2,z)*TILE;
+}
+
+// No closed form for the inverse — iterate. Converges to 1e-12 in 2-3 rounds.
+function py2lat(py, z){
+    var m = (1 - 2*py/Math.pow(2,z)/TILE)*Math.PI;
+    var t = Math.exp(-m);
+    var phi = Math.PI/2 - 2*Math.atan(t);
+    for(var i=0; i<12; i++){
+        var es = ECC*Math.sin(phi);
+        var next = Math.PI/2 - 2*Math.atan(t*Math.pow((1-es)/(1+es), ECC/2));
+        if(Math.abs(next-phi) < 1e-12){ phi = next; break; }
+        phi = next;
+    }
+    return phi*180/Math.PI;
+}
+
+// ── State ──────────────────────────────────────────────────────────────────
+
+var canvas = document.getElementById('c');
+var ctx    = canvas.getContext('2d');
+var tiles  = {};                        // "z/x/y" -> Image
+var lat = 53.1880, lon = 50.1800;       // map centre; Android calls goTo() on load
+var zoom = 15;
+var marker = null;                      // {lat, lon} of the picked point
+
+var MIN_ZOOM = 3, MAX_ZOOM = 19;
+var PIN_HEIGHT = 22;                    // pin tip sits on the point, bubble above it
+
+function tileUrl(x, y, z){ return '/tile?z='+z+'&x='+x+'&y='+y; }
+
+function resize(){
+    canvas.width  = canvas.offsetWidth;
+    canvas.height = canvas.offsetHeight;
+    render();
+}
+
+// ── Rendering ──────────────────────────────────────────────────────────────
+
+function render(){
+    var w = canvas.width, h = canvas.height;
+    if(!w || !h) return;
+
+    ctx.fillStyle = '#e8e0d8';
+    ctx.fillRect(0, 0, w, h);
+
+    // World-pixel coordinates of the viewport's top-left corner
+    var cx = lon2px(lon, zoom), cy = lat2py(lat, zoom);
+    var originX = cx - w/2, originY = cy - h/2;
+    var n = Math.pow(2, zoom);
+
+    var tx0 = Math.floor(originX/TILE), ty0 = Math.floor(originY/TILE);
+    var tx1 = Math.ceil((cx + w/2)/TILE), ty1 = Math.ceil((cy + h/2)/TILE);
+
+    for(var tx = tx0; tx <= tx1; tx++){
+        for(var ty = ty0; ty <= ty1; ty++){
+            if(ty < 0 || ty >= n) continue;          // above the pole or below it
+            var wrapped = ((tx % n) + n) % n;        // wrap across the antimeridian
+            drawTile(wrapped, ty, Math.round(tx*TILE - originX), Math.round(ty*TILE - originY));
+        }
+    }
+
+    if(marker) drawMarker(originX, originY);
+}
+
+function drawTile(x, y, screenX, screenY){
+    var key = zoom+'/'+x+'/'+y;
+    if(!tiles[key]){
+        var img = new Image();
+        img.onload = render;                          // repaint as tiles arrive
+        img.src = tileUrl(x, y, zoom);
+        tiles[key] = img;
+    }
+    var img = tiles[key];
+    if(img.complete && img.naturalWidth > 0){
+        ctx.drawImage(img, screenX, screenY, TILE, TILE);
+    }
+}
+
+function drawMarker(originX, originY){
+    var mx = Math.round(lon2px(marker.lon, zoom) - originX);
+    var my = Math.round(lat2py(marker.lat, zoom) - originY);
+
+    ctx.save();
+    ctx.shadowColor = 'rgba(0,0,0,0.4)';
+    ctx.shadowBlur = 6;
+    ctx.shadowOffsetY = 3;
+
+    ctx.fillStyle = '#1B8A3C';
+    ctx.beginPath();
+    ctx.arc(mx, my - PIN_HEIGHT, 13, 0, Math.PI*2);   // bubble
+    ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(mx, my);                               // tip, on the actual point
+    ctx.lineTo(mx - 9, my - PIN_HEIGHT);
+    ctx.lineTo(mx + 9, my - PIN_HEIGHT);
+    ctx.closePath();
+    ctx.fill();
+
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = 'white';
+    ctx.beginPath();
+    ctx.arc(mx, my - PIN_HEIGHT, 5, 0, Math.PI*2);
+    ctx.fill();
+    ctx.restore();
+}
+
+// ── Panning and picking ────────────────────────────────────────────────────
+//
+// A tap and a drag arrive through the same gesture, so movement past a few pixels
+// marks the gesture as a pan and suppresses the pick on release.
+
+var dragging = false, lastX = 0, lastY = 0, panned = false, startX = 0, startY = 0;
+var PAN_THRESHOLD = 4;
+
+canvas.addEventListener('touchstart', function(e){
+    e.preventDefault();
+    if(e.touches.length !== 1) return;
+    dragging = true; panned = false;
+    lastX = startX = e.touches[0].clientX;
+    lastY = startY = e.touches[0].clientY;
+}, { passive:false });
+
+canvas.addEventListener('touchmove', function(e){
+    e.preventDefault();
+    if(!dragging || e.touches.length !== 1) return;
+    var dx = e.touches[0].clientX - lastX, dy = e.touches[0].clientY - lastY;
+    lastX = e.touches[0].clientX;
+    lastY = e.touches[0].clientY;
+    if(Math.abs(dx) > PAN_THRESHOLD || Math.abs(dy) > PAN_THRESHOLD) panned = true;
+    pan(dx, dy);
+}, { passive:false });
+
+canvas.addEventListener('touchend', function(e){
+    e.preventDefault();     // also suppresses the synthetic click that would follow
+    dragging = false;
+    if(panned) return;
+    var r = canvas.getBoundingClientRect();
+    pick(startX - r.left, startY - r.top);
+}, { passive:false });
+
+// Mouse fallback, for viewing the page outside the app
+canvas.addEventListener('click', function(e){ pick(e.offsetX, e.offsetY); });
+
+function pan(dx, dy){
+    lon = px2lon(lon2px(lon, zoom) - dx, zoom);
+    lat = Math.max(-85, Math.min(85, py2lat(lat2py(lat, zoom) - dy, zoom)));
+    render();
+}
+
+/** Converts a point in canvas pixels to a coordinate and reports it. */
+function pick(x, y){
+    var originX = lon2px(lon, zoom) - canvas.width/2;
+    var originY = lat2py(lat, zoom) - canvas.height/2;
+    var picked = {
+        lat: py2lat(originY + y, zoom),
+        lon: px2lon(originX + x, zoom)
+    };
+    marker = picked;
+    render();
+    notify(picked.lat, picked.lon);
+}
+
+function notify(la, lo){
+    var pill = document.getElementById('coords-pill');
+    pill.textContent = '📍 ' + la.toFixed(5) + ',  ' + lo.toFixed(5);
+    pill.style.display = 'block';
+    document.getElementById('hint').style.display = 'none';
+    if(window.Android) Android.onLocationPicked(la, lo);
+}
+
+// ── Zoom ───────────────────────────────────────────────────────────────────
+
+document.getElementById('zin').addEventListener('click', function(){
+    if(zoom < MAX_ZOOM){ zoom++; tiles = {}; render(); }
+});
+document.getElementById('zout').addEventListener('click', function(){
+    if(zoom > MIN_ZOOM){ zoom--; tiles = {}; render(); }
+});
+
+// ── Android bridge ─────────────────────────────────────────────────────────
+
+/** Centres the map on a point and selects it. Called from MainActivity. */
+function goTo(la, lo, z){
+    lat = la; lon = lo;
+    if(z) zoom = z;
+    marker = { lat: la, lon: lo };
+    tiles = {};
+    render();
+    notify(la, lo);
+}
+
+window.addEventListener('resize', resize);
+resize();
+</script>
+</body>
+</html>
