@@ -253,6 +253,7 @@ class MockLocationService : Service() {
 
     private fun publishGlobal() {
         runCatching {
+            Settings.Global.putString(contentResolver, "gpsemu_active", "1")
             Settings.Global.putString(contentResolver, "gpsemu_lat",     point.latitude.toString())
             Settings.Global.putString(contentResolver, "gpsemu_lon",     point.longitude.toString())
             Settings.Global.putString(contentResolver, "gpsemu_alt",     point.altitude.toString())
@@ -269,9 +270,16 @@ class MockLocationService : Service() {
                 putString("alt",     point.altitude.toString())
                 putString("bearing", point.bearing.toString())
             }
-            apply()   // async — use commit() only on destroy paths that need it
+            apply()
         }
-        if (active) publishGlobal()
+        if (active) {
+            publishGlobal()
+        } else {
+            // Signal the Xposed hook to stop injecting and release lastValidPoint
+            runCatching {
+                Settings.Global.putString(contentResolver, "gpsemu_active", "0")
+            }
+        }
     }
 
     // ── Route utilities ────────────────────────────────────────────────────
