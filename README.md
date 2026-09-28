@@ -1,127 +1,77 @@
 # GPS Emulator
 
-Подмена геолокации на Android 9+ для тестирования карт. Точка выбирается на карте
-Яндекса внутри приложения, после чего система отдаёт эти координаты всем
-приложениям через mock-провайдеры.
+An LSPosed/Xposed module for Android that spoofs device location at the framework level, bypassing both the standard Location API and Yandex's proprietary Flutter LBS SDK. Designed for Yandex Pro and similar apps that use cell-tower positioning as a fallback.
 
-## Как это работает
+## Requirements
 
-```
-map.html (WebView)                MainActivity              MockLocationService
-   тап по карте  ──onLocationPicked──>  GeoPoint  ──start()──>  addTestProvider
-        │                                                       setTestProviderLocation
-        └── /tile?z&x&y ──> YandexTileProxy ──> tile CDN            (раз в секунду)
-```
+- Android 12+ (API 31+)
+- Magisk + Zygisk
+- LSPosed (Zygisk variant)
+- Root: `pm grant com.gpsemu android.permission.WRITE_SECURE_SETTINGS`
 
-1. **map.html** рисует тайлы Яндекса на canvas и переводит тап в координаты.
-2. **YandexTileProxy** подменяет запросы тайлов: WebView не может грузить их сам.
-3. **MockLocationService** регистрирует GPS и network как тестовые провайдеры и
-   раз в секунду публикует текущую точку.
-4. **xposed/** — необязательный модуль LSPosed, прячет признаки подмены от
-   приложений, которые их проверяют. Работает только при установленном LSPosed.
+## Features
 
-## Структура
+- **Point mode** — teleport to a tapped map location instantly; optional camera bearing (0–359°)
+- **Route mode** — draw a multi-waypoint route on the map, then play it back at a chosen speed (km/h) or within a fixed total time (minutes); loop support
+- **Multi-layer spoofing** — patches `LocationManager` test providers, hooks `android.location.Location` field writes (`mLatitude`/`mLongitude` on Samsung One UI), and intercepts `LbsPositionApiModel.getLatitude/getLongitude` so Yandex's cell-tower fallback returns spoofed coords
+- **City presets** — quick-jump buttons for Samara, Moscow, Saint Petersburg, Sochi
+- **Boot persistence** — active point survives reboots via `BootReceiver`
+
+## Architecture
 
 ```
-app/src/main/
-├── assets/
-│   ├── map.html              карта: проекция, рендер тайлов, выбор точки
-│   └── xposed_init           точка входа модуля LSPosed
-├── kotlin/com/gpsemu/
-│   ├── core/
-│   │   ├── GeoPoint.kt       точка + чтение координат из Intent
-│   │   └── LocationFactory.kt сборка правдоподобного Location
-│   ├── map/
-│   │   ├── MapPresets.kt     готовые точки и зум
-│   │   └── YandexTileProxy.kt загрузка тайлов в обход блокировки WebView
-│   ├── service/
-│   │   └── MockLocationService.kt публикация координат в систему
-│   ├── ui/
-│   │   └── MainActivity.kt   экран: чеклист настройки + карта
-│   └── xposed/               скрытие следов mock-провайдера (LSPosed)
-scripts/                      сборка и проверка на эмуляторе
-СОБРАТЬ_APK.ps1               установка окружения и сборка «в один клик»
+MainActivity
+  │
+  ├── WebView (map.html)        Yandex Mercator tile map (EPSG:3395)
+  │     └── YandexTileProxy    Proxies /tile requests to Yandex CDN
+  │
+  └── MockLocationService      Foreground service; feeds test providers
+        └── LocationFactory    Builds realistic Location objects with jitter
+
+LSPosed module (separate process):
+  LocationInjectorHook
+    ├── hooks Location.createFromParcel / setLatitude / setLongitude
+    ├── hooks LbsPositionApiModel.getLatitude / getLongitude
+    └── reads coords from Settings.Global (gpsemu_lat / gpsemu_lon)
 ```
 
-## Сборка и тесты
+## Building
 
-Первый запуск скачивает JDK 17, Android SDK и Gradle (~450 МБ) в
-`%USERPROFILE%\.gpsemu_build`:
-
-```powershell
-.\СОБРАТЬ_APK.ps1
+```bash
+./gradlew assembleDebug
+adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-Полный цикл на MEmu — сборка, перезапуск эмулятора, установка, проверка точности:
+Enable the module in LSPosed → scope: **Yandex Pro** (and `android` system scope).
 
-```powershell
-.\scripts\build-and-test.ps1
-```
+## Route playback
 
-Телепорт без пересборки:
+1. Switch to **Маршрут** mode
+2. Tap the map to add waypoints (numbered blue circles appear)
+3. Long-press to remove the last waypoint
+4. Set speed (km/h) or total travel time (minutes) with the toggle + slider
+5. Toggle **🔁 Петля** to loop indefinitely
+6. Press **▶ Старт**
 
-```powershell
-.\scripts\teleport.ps1 -lat 53.1880 -lon 50.1800
-.\scripts\teleport.ps1 -lat 53.1880 -lon 50.1800 -Screenshot
-```
+The service interpolates position linearly between waypoints and computes the heading (bearing) at each segment, so navigation apps show realistic movement direction.
 
-## Настройка на устройстве
+## IPC between module and service
 
-Подмена требует двух разрешений, которые выдаются вручную — приложение показывает
-чеклист и не откроет карту, пока оба не получены:
+Coordinates are shared via `Settings.Global` keys:
 
-1. разрешение на геолокацию;
-2. **Настройки → Для разработчиков → Приложение для фиктивного местоположения →
-   GPS Emulator**.
+| Key              | Value               |
+|------------------|---------------------|
+| `gpsemu_lat`     | latitude (double)   |
+| `gpsemu_lon`     | longitude (double)  |
+| `gpsemu_alt`     | altitude (double)   |
+| `gpsemu_bearing` | bearing (float, °)  |
 
-Через ADB второй пункт ставится сразу:
+The module reads these on every `Location.createFromParcel` interception and on `LbsPositionApiModel` getter calls with a 500 ms cache.
 
-```powershell
-adb shell appops set com.gpsemu android:mock_location allow
-```
+## Samsung One UI compatibility
 
-## Что важно знать
+Samsung renames internal `Location` fields:
+- AOSP: `mLatitudeDegrees` / `mLongitudeDegrees`
+- One UI: `mLatitude` / `mLongitude`
 
-Три вещи, на которых проект уже ломался. Все три чинились неочевидно, поэтому
-описаны здесь.
-
-### Проекция карты — эллиптический Меркатор
-
-Яндекс отдаёт тайлы в **EPSG:3395** (эллиптический Меркатор), а не в **EPSG:3857**
-(сферический), который используют Google и OSM. Разница растёт с широтой: на 53°
-это 0.18° широты, около **20 км**.
-
-Пока в `map.html` стояли сферические формулы, карта рисовала место на 20 км
-севернее той координаты, которую сообщала приложению. Пользователь тапал по тому,
-что видел, а телепортировался в другое место. Формулы в разделе `Projection` —
-эллиптические, обратное преобразование считается итеративно.
-
-### Передача координат через ADB — только строками
-
-У `am` нет флага для `double`. Флаг `--ef` кладёт **float**, а `getDoubleExtra` на
-float-экстре молча возвращает значение по умолчанию — из-за чего каждый
-скриптовый телепорт уходил в точку 0°N 0°E.
-
-Поэтому скрипты передают координаты строками, а `GeoPoint.fromIntent` принимает
-оба варианта: строки от ADB и `double` от самого приложения.
-
-```powershell
-am startforegroundservice -n com.gpsemu/.service.MockLocationService `
-    --es lat "53.1880" --es lon "50.1800" --es alt "0"
-```
-
-### Проверять надо местоположение, а не маркер
-
-`geo:` intent ставит в Яндекс Картах маркер ровно в переданные координаты —
-**независимо** от того, где «находится» устройство. Сам по себе он ничего не
-проверяет.
-
-Надёжная проверка — `dumpsys location`: там видно, какие координаты система реально
-отдаёт приложениям. Это делает `Test-MockAccuracy`. Визуально позиция сверяется
-так: маркер `geo:` берётся за эталон, и с ним сравнивается точка геолокации.
-
-### Кодировка скриптов
-
-`.ps1` с кириллицей сохраняй в **UTF-8 с BOM**. Без BOM PowerShell 5.1 читает файл
-как cp1251, байты букв Б/В/Г/Д и тире превращаются в кавычки, и парсер падает с
-`The string is missing the terminator`.
+The module discovers field names at runtime via `getDeclaredFields()` and catches `Throwable` (not `Exception`) because `NoSuchFieldError` is an `Error` subclass.

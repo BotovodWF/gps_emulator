@@ -3,17 +3,6 @@
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"/>
-<!--
-  Map surface for the picker.
-
-  Tiles are raster images from Yandex, drawn onto a canvas by hand rather than
-  through a mapping library — the app only needs pan, zoom and a tap handler, and
-  a self-contained renderer keeps the asset small and the coordinate maths visible.
-
-  Requests go to /tile?z=&x=&y=, which YandexTileProxy intercepts on the Kotlin
-  side. Fetching the CDN directly from here does not work: WebView blocks the
-  cross-origin image loads and reports nothing.
--->
 <style>
 * { margin:0; padding:0; box-sizing:border-box; }
 html, body { width:100%; height:100%; overflow:hidden; font-family:sans-serif; }
@@ -22,7 +11,7 @@ canvas { display:block; width:100%; height:100%; }
 
 #hint {
     position:absolute; top:12px; left:50%; transform:translateX(-50%);
-    background:rgba(0,0,0,.65); color:#fff; padding:7px 18px;
+    background:rgba(0,0,0,.62); color:#fff; padding:7px 18px;
     border-radius:20px; font-size:14px; z-index:9; pointer-events:none; white-space:nowrap;
 }
 #coords-pill {
@@ -31,11 +20,17 @@ canvas { display:block; width:100%; height:100%; }
     border-radius:24px; font-size:15px; font-weight:bold; z-index:9;
     pointer-events:none; white-space:nowrap; display:none;
 }
+#route-pill {
+    position:absolute; bottom:14px; left:50%; transform:translateX(-50%);
+    background:rgba(21,101,192,.92); color:#fff; padding:8px 20px;
+    border-radius:24px; font-size:14px; font-weight:bold; z-index:9;
+    pointer-events:none; white-space:nowrap; display:none;
+}
 #zoom-btns {
     position:absolute; top:12px; left:12px; display:flex; flex-direction:column; z-index:9;
 }
 .zbtn {
-    width:34px; height:34px; background:#fff; border:1px solid #ccc;
+    width:36px; height:36px; background:#fff; border:1px solid #ccc;
     font-size:22px; line-height:1; cursor:pointer; display:flex; align-items:center;
     justify-content:center; user-select:none; color:#333;
 }
@@ -51,6 +46,7 @@ canvas { display:block; width:100%; height:100%; }
   <canvas id="c"></canvas>
   <div id="hint">👆 Нажми на карту для выбора точки</div>
   <div id="coords-pill"></div>
+  <div id="route-pill"></div>
   <div id="zoom-btns">
     <div class="zbtn" id="zin">+</div>
     <div class="zbtn" id="zout">−</div>
@@ -60,19 +56,11 @@ canvas { display:block; width:100%; height:100%; }
 
 <script>
 // ── Projection ─────────────────────────────────────────────────────────────
-//
-// Yandex serves tiles in ELLIPTICAL Mercator (EPSG:3395), not the spherical
-// Mercator (EPSG:3857) that Google and OSM use. The two differ by the eccentricity
-// term below, and the gap grows with latitude: at 53°N it reaches 0.18° of
-// latitude — about 20 km.
-//
-// This matters because the maths here decides which tile to draw and which
-// coordinate a tap corresponds to. With spherical formulas the map rendered a
-// place 20 km north of the coordinate it reported, so every point the user picked
-// teleported somewhere they had not chosen.
+// Yandex tiles use EPSG:3395 (elliptical Mercator). See the original comment
+// in the first version of this file for why spherical formulas were wrong here.
 
 var TILE = 256;
-var ECC  = 0.0818191908426;   // WGS84 eccentricity
+var ECC  = 0.0818191908426;
 
 function lon2px(lon, z){ return (lon+180)/360*Math.pow(2,z)*TILE; }
 function px2lon(px, z){ return px/Math.pow(2,z)/TILE*360-180; }
@@ -84,7 +72,6 @@ function lat2py(lat, z){
     return (1 - m/Math.PI)/2*Math.pow(2,z)*TILE;
 }
 
-// No closed form for the inverse — iterate. Converges to 1e-12 in 2-3 rounds.
 function py2lat(py, z){
     var m = (1 - 2*py/Math.pow(2,z)/TILE)*Math.PI;
     var t = Math.exp(-m);
@@ -102,13 +89,17 @@ function py2lat(py, z){
 
 var canvas = document.getElementById('c');
 var ctx    = canvas.getContext('2d');
-var tiles  = {};                        // "z/x/y" -> Image
-var lat = 53.1880, lon = 50.1800;       // map centre; Android calls goTo() on load
+var tiles  = {};
+var lat = 53.1880, lon = 50.1800;
 var zoom = 15;
-var marker = null;                      // {lat, lon} of the picked point
+var marker = null;          // {lat, lon} — picked point in point mode
+var markerBearing = 0;      // degrees, shown as arrow on marker
+
+var mapMode = 'point';      // 'point' | 'route'
+var routeWaypoints = [];    // [{lat, lon}] in route mode
 
 var MIN_ZOOM = 3, MAX_ZOOM = 19;
-var PIN_HEIGHT = 22;                    // pin tip sits on the point, bubble above it
+var PIN_HEIGHT = 22;
 
 function tileUrl(x, y, z){ return '/tile?z='+z+'&x='+x+'&y='+y; }
 
@@ -116,6 +107,43 @@ function resize(){
     canvas.width  = canvas.offsetWidth;
     canvas.height = canvas.offsetHeight;
     render();
+}
+
+// ── Android bridge calls ───────────────────────────────────────────────────
+
+function setMode(m){
+    mapMode = m;
+    var hint = document.getElementById('hint');
+    if(m === 'route'){
+        hint.textContent = '📍 Tap to add waypoints • Long-press to remove last';
+        hint.style.display = 'block';
+        document.getElementById('coords-pill').style.display = 'none';
+    } else {
+        hint.textContent = '👆 Нажми на карту для выбора точки';
+        hint.style.display = 'block';
+        document.getElementById('route-pill').style.display = 'none';
+    }
+    render();
+}
+
+function setMarkerBearing(deg){
+    markerBearing = deg;
+    render();
+}
+
+function clearRoute(){
+    routeWaypoints = [];
+    document.getElementById('route-pill').style.display = 'none';
+    render();
+}
+
+function goTo(la, lo, z){
+    lat = la; lon = lo;
+    if(z) zoom = z;
+    marker = { lat: la, lon: lo };
+    tiles = {};
+    render();
+    notifyPicked(la, lo);
 }
 
 // ── Rendering ──────────────────────────────────────────────────────────────
@@ -127,7 +155,6 @@ function render(){
     ctx.fillStyle = '#e8e0d8';
     ctx.fillRect(0, 0, w, h);
 
-    // World-pixel coordinates of the viewport's top-left corner
     var cx = lon2px(lon, zoom), cy = lat2py(lat, zoom);
     var originX = cx - w/2, originY = cy - h/2;
     var n = Math.pow(2, zoom);
@@ -137,20 +164,24 @@ function render(){
 
     for(var tx = tx0; tx <= tx1; tx++){
         for(var ty = ty0; ty <= ty1; ty++){
-            if(ty < 0 || ty >= n) continue;          // above the pole or below it
-            var wrapped = ((tx % n) + n) % n;        // wrap across the antimeridian
+            if(ty < 0 || ty >= n) continue;
+            var wrapped = ((tx % n) + n) % n;
             drawTile(wrapped, ty, Math.round(tx*TILE - originX), Math.round(ty*TILE - originY));
         }
     }
 
-    if(marker) drawMarker(originX, originY);
+    if(mapMode === 'route'){
+        drawRoute(originX, originY);
+    } else if(marker){
+        drawMarker(originX, originY);
+    }
 }
 
 function drawTile(x, y, screenX, screenY){
     var key = zoom+'/'+x+'/'+y;
     if(!tiles[key]){
         var img = new Image();
-        img.onload = render;                          // repaint as tiles arrive
+        img.onload = render;
         img.src = tileUrl(x, y, zoom);
         tiles[key] = img;
     }
@@ -160,41 +191,99 @@ function drawTile(x, y, screenX, screenY){
     }
 }
 
+// ── Point marker with optional bearing arrow ───────────────────────────────
+
 function drawMarker(originX, originY){
     var mx = Math.round(lon2px(marker.lon, zoom) - originX);
     var my = Math.round(lat2py(marker.lat, zoom) - originY);
 
     ctx.save();
     ctx.shadowColor = 'rgba(0,0,0,0.4)';
-    ctx.shadowBlur = 6;
-    ctx.shadowOffsetY = 3;
-
+    ctx.shadowBlur = 6; ctx.shadowOffsetY = 3;
     ctx.fillStyle = '#1B8A3C';
+    ctx.beginPath(); ctx.arc(mx, my - PIN_HEIGHT, 13, 0, Math.PI*2); ctx.fill();
     ctx.beginPath();
-    ctx.arc(mx, my - PIN_HEIGHT, 13, 0, Math.PI*2);   // bubble
-    ctx.fill();
-    ctx.beginPath();
-    ctx.moveTo(mx, my);                               // tip, on the actual point
+    ctx.moveTo(mx, my);
     ctx.lineTo(mx - 9, my - PIN_HEIGHT);
     ctx.lineTo(mx + 9, my - PIN_HEIGHT);
-    ctx.closePath();
-    ctx.fill();
-
+    ctx.closePath(); ctx.fill();
     ctx.shadowBlur = 0;
     ctx.fillStyle = 'white';
-    ctx.beginPath();
-    ctx.arc(mx, my - PIN_HEIGHT, 5, 0, Math.PI*2);
-    ctx.fill();
+    ctx.beginPath(); ctx.arc(mx, my - PIN_HEIGHT, 5, 0, Math.PI*2); ctx.fill();
     ctx.restore();
+
+    if(markerBearing > 0){
+        var rad = (markerBearing - 90) * Math.PI / 180;
+        var len = 26;
+        var bx = mx + Math.cos(rad) * len;
+        var by = (my - PIN_HEIGHT) + Math.sin(rad) * len;
+        ctx.save();
+        ctx.strokeStyle = '#FF6B00'; ctx.lineWidth = 2.5; ctx.lineCap = 'round';
+        ctx.beginPath();
+        ctx.moveTo(mx, my - PIN_HEIGHT);
+        ctx.lineTo(bx, by);
+        ctx.stroke();
+        var ang = Math.atan2(by - (my - PIN_HEIGHT), bx - mx);
+        ctx.fillStyle = '#FF6B00';
+        ctx.beginPath();
+        ctx.moveTo(bx, by);
+        ctx.lineTo(bx - 8*Math.cos(ang - 0.45), by - 8*Math.sin(ang - 0.45));
+        ctx.lineTo(bx - 8*Math.cos(ang + 0.45), by - 8*Math.sin(ang + 0.45));
+        ctx.closePath(); ctx.fill();
+        ctx.restore();
+    }
+}
+
+// ── Route drawing ──────────────────────────────────────────────────────────
+
+function toScreen(wp, originX, originY){
+    return {
+        x: Math.round(lon2px(wp.lon, zoom) - originX),
+        y: Math.round(lat2py(wp.lat, zoom) - originY)
+    };
+}
+
+function drawRoute(originX, originY){
+    if(routeWaypoints.length === 0) return;
+
+    var pts = routeWaypoints.map(function(wp){ return toScreen(wp, originX, originY); });
+
+    // Polyline
+    if(pts.length >= 2){
+        ctx.save();
+        ctx.strokeStyle = '#1565C0';
+        ctx.lineWidth = 3;
+        ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+        ctx.setLineDash([]);
+        ctx.beginPath();
+        ctx.moveTo(pts[0].x, pts[0].y);
+        for(var i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+        ctx.stroke();
+        ctx.restore();
+    }
+
+    // Numbered waypoint circles
+    pts.forEach(function(p, i){
+        var isLast = (i === pts.length - 1);
+        ctx.save();
+        ctx.shadowColor = 'rgba(0,0,0,0.35)'; ctx.shadowBlur = 5;
+        ctx.fillStyle = isLast ? '#E53935' : '#1565C0';
+        ctx.beginPath(); ctx.arc(p.x, p.y, 13, 0, Math.PI*2); ctx.fill();
+        ctx.shadowBlur = 0;
+        ctx.fillStyle = 'white';
+        ctx.font = 'bold 10px sans-serif';
+        ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+        ctx.fillText(String(i + 1), p.x, p.y);
+        ctx.restore();
+    });
 }
 
 // ── Panning and picking ────────────────────────────────────────────────────
-//
-// A tap and a drag arrive through the same gesture, so movement past a few pixels
-// marks the gesture as a pan and suppresses the pick on release.
 
 var dragging = false, lastX = 0, lastY = 0, panned = false, startX = 0, startY = 0;
-var PAN_THRESHOLD = 4;
+var touchStartTime = 0;
+var PAN_THRESHOLD = 6;
+var LONG_PRESS_MS = 500;
 
 canvas.addEventListener('touchstart', function(e){
     e.preventDefault();
@@ -202,27 +291,37 @@ canvas.addEventListener('touchstart', function(e){
     dragging = true; panned = false;
     lastX = startX = e.touches[0].clientX;
     lastY = startY = e.touches[0].clientY;
+    touchStartTime = Date.now();
 }, { passive:false });
 
 canvas.addEventListener('touchmove', function(e){
     e.preventDefault();
     if(!dragging || e.touches.length !== 1) return;
     var dx = e.touches[0].clientX - lastX, dy = e.touches[0].clientY - lastY;
-    lastX = e.touches[0].clientX;
-    lastY = e.touches[0].clientY;
-    if(Math.abs(dx) > PAN_THRESHOLD || Math.abs(dy) > PAN_THRESHOLD) panned = true;
+    lastX = e.touches[0].clientX; lastY = e.touches[0].clientY;
+    if(Math.abs(startX - lastX) > PAN_THRESHOLD || Math.abs(startY - lastY) > PAN_THRESHOLD) panned = true;
     pan(dx, dy);
 }, { passive:false });
 
 canvas.addEventListener('touchend', function(e){
-    e.preventDefault();     // also suppresses the synthetic click that would follow
+    e.preventDefault();
     dragging = false;
     if(panned) return;
+    var elapsed = Date.now() - touchStartTime;
     var r = canvas.getBoundingClientRect();
+    if(elapsed >= LONG_PRESS_MS && mapMode === 'route'){
+        // Long press: remove last waypoint
+        if(routeWaypoints.length > 0){
+            routeWaypoints.pop();
+            render();
+            updateRoutePill();
+            if(window.Android) Android.onWaypointRemoved();
+        }
+        return;
+    }
     pick(startX - r.left, startY - r.top);
 }, { passive:false });
 
-// Mouse fallback, for viewing the page outside the app
 canvas.addEventListener('click', function(e){ pick(e.offsetX, e.offsetY); });
 
 function pan(dx, dy){
@@ -231,7 +330,6 @@ function pan(dx, dy){
     render();
 }
 
-/** Converts a point in canvas pixels to a coordinate and reports it. */
 function pick(x, y){
     var originX = lon2px(lon, zoom) - canvas.width/2;
     var originY = lat2py(lat, zoom) - canvas.height/2;
@@ -239,17 +337,33 @@ function pick(x, y){
         lat: py2lat(originY + y, zoom),
         lon: px2lon(originX + x, zoom)
     };
-    marker = picked;
-    render();
-    notify(picked.lat, picked.lon);
+    if(mapMode === 'route'){
+        routeWaypoints.push(picked);
+        render();
+        updateRoutePill();
+        if(window.Android) Android.onWaypointAdded(picked.lat, picked.lon);
+    } else {
+        marker = picked;
+        render();
+        notifyPicked(picked.lat, picked.lon);
+    }
 }
 
-function notify(la, lo){
+function notifyPicked(la, lo){
     var pill = document.getElementById('coords-pill');
     pill.textContent = '📍 ' + la.toFixed(5) + ',  ' + lo.toFixed(5);
     pill.style.display = 'block';
     document.getElementById('hint').style.display = 'none';
     if(window.Android) Android.onLocationPicked(la, lo);
+}
+
+function updateRoutePill(){
+    var pill = document.getElementById('route-pill');
+    var n = routeWaypoints.length;
+    if(n === 0){ pill.style.display = 'none'; return; }
+    pill.textContent = '🛣 ' + n + ' ' + (n === 1 ? 'точка' : n < 5 ? 'точки' : 'точек');
+    pill.style.display = 'block';
+    document.getElementById('hint').style.display = 'none';
 }
 
 // ── Zoom ───────────────────────────────────────────────────────────────────
@@ -260,18 +374,6 @@ document.getElementById('zin').addEventListener('click', function(){
 document.getElementById('zout').addEventListener('click', function(){
     if(zoom > MIN_ZOOM){ zoom--; tiles = {}; render(); }
 });
-
-// ── Android bridge ─────────────────────────────────────────────────────────
-
-/** Centres the map on a point and selects it. Called from MainActivity. */
-function goTo(la, lo, z){
-    lat = la; lon = lo;
-    if(z) zoom = z;
-    marker = { lat: la, lon: lo };
-    tiles = {};
-    render();
-    notify(la, lo);
-}
 
 window.addEventListener('resize', resize);
 resize();

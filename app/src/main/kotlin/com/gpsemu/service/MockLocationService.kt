@@ -19,259 +19,361 @@ import com.gpsemu.core.GeoPoint
 import com.gpsemu.core.LocationFactory
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import org.json.JSONArray
+import org.json.JSONObject
+import kotlin.math.atan2
+import kotlin.math.cos
+import kotlin.math.pow
+import kotlin.math.sin
+import kotlin.math.sqrt
 
-/**
- * Feeds a fixed position into the system location providers.
- *
- * The service registers GPS and network as test providers once, then pushes the
- * current point to both once a second. Teleporting does not restart anything — it
- * only swaps [point], and the running loop picks up the new value on its next tick.
- * Re-registering the providers on every teleport used to drop the fix for a moment
- * and made maps apps fall back to their last known position.
- */
 class MockLocationService : Service() {
 
     private lateinit var locationManager: LocationManager
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
 
     @Volatile private var point = GeoPoint(0.0, 0.0)
+    @Volatile private var currentSpeedMps = 0f
     @Volatile private var emitting = false
+    @Volatile private var routeActive = false
+    @Volatile private var routePaused = false
+    private var routeJob: Job? = null
+    private var lastGlobalWriteMs = 0L
+
+    // ── Lifecycle ──────────────────────────────────────────────────────────
 
     override fun onCreate() {
         super.onCreate()
-        Log.e(TAG, "onCreate START")
         locationManager = getSystemService(LOCATION_SERVICE) as LocationManager
-
-        // Restore last active point so a START_STICKY restart doesn't land on (0,0)
-        val prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
-        if (prefs.getBoolean("active", false)) {
-            val lat = prefs.getString("lat", null)?.toDoubleOrNull()
-            val lon = prefs.getString("lon", null)?.toDoubleOrNull()
-            val alt = prefs.getString("alt", "0")?.toDoubleOrNull() ?: 0.0
-            if (lat != null && lon != null) point = GeoPoint(lat, lon, alt)
-        }
-        Log.e(TAG, "onCreate point=${point.latitude},${point.longitude}")
-
-        // Auto-register as mock_location_app and enable high-accuracy GPS (requires WRITE_SECURE_SETTINGS)
-        runCatching {
-            Settings.Secure.putString(contentResolver, "mock_location_app", packageName)
-        }.onFailure { Log.e(TAG, "mock_location_app write failed: ${it.message}") }
-        runCatching {
-            Settings.Secure.putInt(
-                contentResolver,
-                Settings.Secure.LOCATION_MODE,
-                Settings.Secure.LOCATION_MODE_HIGH_ACCURACY,
-            )
-        }.onFailure { Log.e(TAG, "location_mode write failed: ${it.message}") }
-
+        restoreSavedPoint()
+        applySystemSettings()
         createChannel()
-        Log.e(TAG, "calling startInForeground")
-        try {
-            startInForeground()
-            Log.e(TAG, "startInForeground OK")
-        } catch (e: Exception) {
-            Log.e(TAG, "startInForeground FAILED: ${e.javaClass.simpleName}: ${e.message}")
-            // Fall back to non-typed foreground (Android < 14 path)
-            try {
-                startForeground(NOTIF_ID, buildNotification())
-                Log.e(TAG, "startForeground fallback OK")
-            } catch (e2: Exception) {
-                Log.e(TAG, "startForeground fallback also FAILED: ${e2.message}")
-            }
-        }
-        Log.e(TAG, "calling registerProviders")
+        startInForeground()
         registerProviders()
-        Log.e(TAG, "onCreate DONE")
+    }
+
+    private fun restoreSavedPoint() {
+        val p = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+        if (!p.getBoolean("active", false)) return
+        val lat = p.getString("lat", null)?.toDoubleOrNull() ?: return
+        val lon = p.getString("lon", null)?.toDoubleOrNull() ?: return
+        val alt = p.getString("alt", "0")?.toDoubleOrNull() ?: 0.0
+        val brg = p.getString("bearing", "0")?.toFloatOrNull() ?: 0f
+        point = GeoPoint(lat, lon, alt, brg)
+    }
+
+    private fun applySystemSettings() {
+        runCatching { Settings.Secure.putString(contentResolver, "mock_location_app", packageName) }
+        runCatching {
+            Settings.Secure.putInt(contentResolver, Settings.Secure.LOCATION_MODE,
+                Settings.Secure.LOCATION_MODE_HIGH_ACCURACY)
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        Log.e(TAG, "onStartCommand action=${intent?.action} emitting=$emitting")
-        if (intent?.action == ACTION_STOP) {
-            saveActive(false)
-            stopSelf()
-            return START_NOT_STICKY
-        }
-
-        val newPoint = GeoPoint.fromIntent(intent, point)
-        val teleported = newPoint != point
-        point = newPoint
-        Log.e(TAG, "onStartCommand point=${point.latitude},${point.longitude} teleported=$teleported")
-        saveActive(true)
-
-        // Re-assert providers on every teleport (MEmu can disable them)
-        PROVIDERS.forEach { runCatching { locationManager.setTestProviderEnabled(it, true) } }
-
-        if (!emitting) {
-            emitting = true
-            Log.e(TAG, "launching emitLoop")
-            scope.launch { emitLoop() }
-        } else if (teleported) {
-            // Burst-emit the new position immediately so the map snaps rather than flies
-            Log.e(TAG, "launching emitBurst")
-            scope.launch { emitBurst(newPoint) }
-        }
-        return START_STICKY
-    }
-
-    // Fires BURST_COUNT rapid updates so the map settles on the new point instantly
-    private suspend fun emitBurst(pt: GeoPoint) {
-        repeat(BURST_COUNT) {
-            pushPoint(pt)
-            delay(BURST_INTERVAL_MS)
-        }
-    }
-
-    @Suppress("MissingPermission")
-    private suspend fun emitLoop() {
-        Log.e(TAG, "emitLoop STARTED")
-        var count = 0L
-        while (true) {
-            pushPoint(point)
-            count++
-            if (count % 50 == 0L) {
-                Log.e(TAG, "emitLoop tick $count lat=${point.latitude}")
-                // Read back what the system actually delivers to apps
-                PROVIDERS.forEach { provider ->
-                    runCatching {
-                        val loc = locationManager.getLastKnownLocation(provider)
-                        Log.e(TAG, "getLastKnown($provider): lat=${loc?.latitude} lon=${loc?.longitude} mock=${loc?.isFromMockProvider} et=${loc?.elapsedRealtimeNanos}")
-                    }.onFailure { Log.e(TAG, "getLastKnown($provider) err: ${it.message}") }
-                }
-            }
-            delay(EMIT_INTERVAL_MS)
-        }
-    }
-
-    private var pushLogCount = 0L
-
-    private fun pushPoint(pt: GeoPoint) {
-        pushLogCount++
-        val verbose = (pushLogCount == 1L || pushLogCount % 50 == 0L)
-        PROVIDERS.forEach { provider ->
-            runCatching {
-                locationManager.setTestProviderLocation(
-                    provider,
-                    LocationFactory.stationary(provider, pt),
-                )
-                if (verbose) Log.e(TAG, "setTestProviderLocation $provider OK #$pushLogCount lat=${pt.latitude}")
-            }.onFailure { Log.e(TAG, "setTestProviderLocation $provider FAIL #$pushLogCount: ${it.javaClass.simpleName}: ${it.message}") }
-        }
-    }
-
-    // ── Test providers ─────────────────────────────────────────────────────
-
-    /**
-     * Registers every provider independently: a ROM that refuses one of them (fused
-     * is the likely candidate) must not stop the others from being set up.
-     */
-    private fun registerProviders() {
-        PROVIDERS.forEach { provider ->
-            runCatching { locationManager.removeTestProvider(provider) }
-                .onSuccess { Log.e(TAG, "removeTestProvider $provider OK") }
-                .onFailure { Log.e(TAG, "removeTestProvider $provider FAIL: ${it.message}") }
-            runCatching {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                    val props = ProviderProperties.Builder()
-                        .setHasNetworkRequirement(false)
-                        .setHasSatelliteRequirement(false)
-                        .setHasCellRequirement(false)
-                        .setHasMonetaryCost(false)
-                        .setHasAltitudeSupport(true)
-                        .setHasSpeedSupport(true)
-                        .setHasBearingSupport(true)
-                        .setPowerUsage(ProviderProperties.POWER_USAGE_HIGH)
-                        .setAccuracy(ProviderProperties.ACCURACY_FINE)
-                        .build()
-                    locationManager.addTestProvider(provider, props)
-                    Log.e(TAG, "addTestProvider $provider (ProviderProperties API) OK")
-                } else {
-                    @Suppress("DEPRECATION")
-                    locationManager.addTestProvider(
-                        provider,
-                        false, false, false, false, true, true, true,
-                        Criteria.POWER_HIGH, Criteria.ACCURACY_FINE,
-                    )
-                    Log.e(TAG, "addTestProvider $provider (legacy API) OK")
-                }
-                locationManager.setTestProviderEnabled(provider, true)
-                Log.e(TAG, "setTestProviderEnabled $provider OK")
-            }.onFailure { Log.e(TAG, "provider $provider FAIL: ${it.javaClass.simpleName}: ${it.message}") }
-        }
-    }
-
-    private fun unregisterProviders() {
-        PROVIDERS.forEach { provider ->
-            runCatching {
-                locationManager.setTestProviderEnabled(provider, false)
-                locationManager.removeTestProvider(provider)
-            }
+        return when (intent?.action) {
+            ACTION_STOP    -> handleStop()
+            ACTION_PAUSE   -> handlePause()
+            ACTION_RESUME  -> handleResume()
+            ACTION_START_ROUTE -> handleStartRoute(intent)
+            else           -> handleTeleport(intent)
         }
     }
 
     override fun onDestroy() {
         scope.cancel()
         unregisterProviders()
-        saveActive(false)
+        saveState(active = false)
         super.onDestroy()
-    }
-
-    private fun saveActive(active: Boolean) {
-        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit().apply {
-            putBoolean("active", active)
-            if (active) {
-                putString("lat", point.latitude.toString())
-                putString("lon", point.longitude.toString())
-                putString("alt", point.altitude.toString())
-            }
-            commit()
-        }
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
+    // ── Intent handlers ────────────────────────────────────────────────────
+
+    private fun handleStop(): Int {
+        cancelRoute()
+        saveState(active = false)
+        stopSelf()
+        return START_NOT_STICKY
+    }
+
+    private fun handlePause(): Int {
+        routePaused = true
+        currentSpeedMps = 0f
+        return START_STICKY
+    }
+
+    private fun handleResume(): Int {
+        routePaused = false
+        return START_STICKY
+    }
+
+    private fun handleStartRoute(intent: Intent): Int {
+        val json  = intent.getStringExtra(EXTRA_WAYPOINTS_JSON) ?: return START_STICKY
+        val speed = intent.getFloatExtra(EXTRA_SPEED_KMH, 60f)
+        val time  = intent.getIntExtra(EXTRA_TIME_SEC, 0)
+        val loop  = intent.getBooleanExtra(EXTRA_LOOP, false)
+        val wps   = parseWaypoints(json)
+        if (wps.size < 2) return START_STICKY
+
+        cancelRoute()
+        point = wps[0]
+        routeActive = true
+        routePaused = false
+        saveState(active = true)
+        ensureEmitting()
+        routeJob = scope.launch { playRoute(wps, speed, time, loop) }
+        return START_STICKY
+    }
+
+    private fun handleTeleport(intent: Intent?): Int {
+        val newPoint = GeoPoint.fromIntent(intent, point)
+        val moved = newPoint != point
+        point = newPoint
+        currentSpeedMps = 0f
+        saveState(active = true)
+        PROVIDERS.forEach { runCatching { locationManager.setTestProviderEnabled(it, true) } }
+        if (!emitting) {
+            ensureEmitting()
+        } else if (moved) {
+            scope.launch { emitBurst(newPoint) }
+        }
+        return START_STICKY
+    }
+
+    // ── Route playback ─────────────────────────────────────────────────────
+
+    private suspend fun playRoute(
+        waypoints: List<GeoPoint>,
+        speedKmh: Float,
+        totalTimeSec: Int,
+        loop: Boolean,
+    ) {
+        val totalDist = waypoints.zipWithNext { a, b -> haversine(a, b) }.sum()
+        do {
+            for (i in 0 until waypoints.size - 1) {
+                if (!routeActive) return
+                traverseSegment(waypoints[i], waypoints[i + 1], speedKmh, totalTimeSec, totalDist)
+            }
+            // Settle on the last waypoint with zero speed
+            val last = waypoints.last()
+            val prev = waypoints[waypoints.size - 2]
+            point = last.copy(bearing = calcBearing(prev, last))
+            currentSpeedMps = 0f
+            publishGlobal()
+            if (!loop) break
+            delay(600)
+        } while (routeActive)
+
+        routeActive = false
+        currentSpeedMps = 0f
+    }
+
+    private suspend fun traverseSegment(
+        from: GeoPoint, to: GeoPoint,
+        speedKmh: Float, totalTimeSec: Int, totalDist: Double,
+    ) {
+        val dist    = haversine(from, to)
+        val bearing = calcBearing(from, to)
+        val durationMs: Long = when {
+            totalTimeSec > 0 && totalDist > 0 ->
+                (dist / totalDist * totalTimeSec * 1000.0).toLong().coerceAtLeast(200L)
+            speedKmh > 0 ->
+                (dist / (speedKmh / 3.6) * 1000.0).toLong().coerceAtLeast(200L)
+            else -> 5_000L
+        }
+        val segSpeedMps = (dist / (durationMs / 1000.0)).toFloat()
+        val startMs = System.currentTimeMillis()
+        val UPDATE_MS = 150L
+
+        while (System.currentTimeMillis() < startMs + durationMs) {
+            if (!routeActive) return
+            if (routePaused) { currentSpeedMps = 0f; delay(100); continue }
+
+            currentSpeedMps = segSpeedMps
+            val t = ((System.currentTimeMillis() - startMs).toDouble() / durationMs).coerceIn(0.0, 1.0)
+            point = GeoPoint(
+                latitude  = from.latitude  + (to.latitude  - from.latitude)  * t,
+                longitude = from.longitude + (to.longitude - from.longitude) * t,
+                altitude  = from.altitude,
+                bearing   = bearing,
+            )
+            maybePublishGlobal()
+            delay(UPDATE_MS)
+        }
+    }
+
+    // ── Emission helpers ───────────────────────────────────────────────────
+
+    private fun ensureEmitting() {
+        if (emitting) return
+        emitting = true
+        scope.launch { emitLoop() }
+    }
+
+    private suspend fun emitBurst(pt: GeoPoint) {
+        repeat(BURST_COUNT) { pushPoint(pt); delay(BURST_INTERVAL_MS) }
+    }
+
+    private suspend fun emitLoop() {
+        var tick = 0L
+        while (true) {
+            pushPoint(point)
+            if (++tick % 50L == 0L) Log.d(TAG, "tick=$tick lat=${point.latitude} spd=$currentSpeedMps")
+            delay(EMIT_INTERVAL_MS)
+        }
+    }
+
+    private fun pushPoint(pt: GeoPoint) {
+        PROVIDERS.forEach { provider ->
+            runCatching {
+                val loc = if (currentSpeedMps > 0.1f)
+                    LocationFactory.moving(provider, pt, currentSpeedMps)
+                else
+                    LocationFactory.stationary(provider, pt)
+                locationManager.setTestProviderLocation(provider, loc)
+            }
+        }
+    }
+
+    // ── Settings.Global IPC (throttled) ────────────────────────────────────
+
+    private fun maybePublishGlobal() {
+        val now = System.currentTimeMillis()
+        if (now - lastGlobalWriteMs < GLOBAL_WRITE_THROTTLE_MS) return
+        publishGlobal()
+        lastGlobalWriteMs = now
+    }
+
+    private fun publishGlobal() {
+        runCatching {
+            Settings.Global.putString(contentResolver, "gpsemu_lat",     point.latitude.toString())
+            Settings.Global.putString(contentResolver, "gpsemu_lon",     point.longitude.toString())
+            Settings.Global.putString(contentResolver, "gpsemu_alt",     point.altitude.toString())
+            Settings.Global.putString(contentResolver, "gpsemu_bearing", point.bearing.toString())
+        }
+    }
+
+    private fun saveState(active: Boolean) {
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit().apply {
+            putBoolean("active", active)
+            if (active) {
+                putString("lat",     point.latitude.toString())
+                putString("lon",     point.longitude.toString())
+                putString("alt",     point.altitude.toString())
+                putString("bearing", point.bearing.toString())
+            }
+            apply()   // async — use commit() only on destroy paths that need it
+        }
+        if (active) publishGlobal()
+    }
+
+    // ── Route utilities ────────────────────────────────────────────────────
+
+    private fun cancelRoute() {
+        routeJob?.cancel(); routeJob = null
+        routeActive = false; routePaused = false; currentSpeedMps = 0f
+    }
+
+    private fun haversine(a: GeoPoint, b: GeoPoint): Double {
+        val R = 6_371_000.0
+        val φ1 = Math.toRadians(a.latitude);  val φ2 = Math.toRadians(b.latitude)
+        val Δφ = Math.toRadians(b.latitude  - a.latitude)
+        val Δλ = Math.toRadians(b.longitude - a.longitude)
+        val s = sin(Δφ / 2).pow(2) + cos(φ1) * cos(φ2) * sin(Δλ / 2).pow(2)
+        return R * 2 * atan2(sqrt(s), sqrt(1 - s))
+    }
+
+    private fun calcBearing(from: GeoPoint, to: GeoPoint): Float {
+        val φ1 = Math.toRadians(from.latitude);  val φ2 = Math.toRadians(to.latitude)
+        val Δλ = Math.toRadians(to.longitude - from.longitude)
+        val y  = sin(Δλ) * cos(φ2)
+        val x  = cos(φ1) * sin(φ2) - sin(φ1) * cos(φ2) * cos(Δλ)
+        return ((Math.toDegrees(atan2(y, x)).toFloat() + 360) % 360)
+    }
+
+    private fun parseWaypoints(json: String): List<GeoPoint> = runCatching {
+        val arr = JSONArray(json)
+        (0 until arr.length()).map { i ->
+            val o = arr.getJSONObject(i)
+            GeoPoint(o.getDouble("lat"), o.getDouble("lon"), o.optDouble("alt", 0.0))
+        }
+    }.getOrElse { Log.w(TAG, "parseWaypoints failed: ${it.message}"); emptyList() }
+
+    // ── Provider management ────────────────────────────────────────────────
+
+    private fun registerProviders() {
+        PROVIDERS.forEach { name ->
+            runCatching { locationManager.removeTestProvider(name) }
+            runCatching {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    val props = ProviderProperties.Builder()
+                        .setHasNetworkRequirement(false).setHasSatelliteRequirement(false)
+                        .setHasCellRequirement(false).setHasMonetaryCost(false)
+                        .setHasAltitudeSupport(true).setHasSpeedSupport(true).setHasBearingSupport(true)
+                        .setPowerUsage(ProviderProperties.POWER_USAGE_HIGH)
+                        .setAccuracy(ProviderProperties.ACCURACY_FINE).build()
+                    locationManager.addTestProvider(name, props)
+                } else {
+                    @Suppress("DEPRECATION")
+                    locationManager.addTestProvider(name, false, false, false, false,
+                        true, true, true, Criteria.POWER_HIGH, Criteria.ACCURACY_FINE)
+                }
+                locationManager.setTestProviderEnabled(name, true)
+            }.onFailure { Log.w(TAG, "provider $name register failed: ${it.message}") }
+        }
+    }
+
+    private fun unregisterProviders() {
+        PROVIDERS.forEach { name ->
+            runCatching {
+                locationManager.setTestProviderEnabled(name, false)
+                locationManager.removeTestProvider(name)
+            }
+        }
+    }
+
     // ── Notification ───────────────────────────────────────────────────────
 
     private fun startInForeground() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(NOTIF_ID, buildNotification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION)
-        } else {
-            startForeground(NOTIF_ID, buildNotification())
+        runCatching {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                startForeground(NOTIF_ID, buildNotification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION)
+            } else {
+                startForeground(NOTIF_ID, buildNotification())
+            }
+        }.onFailure {
+            runCatching { startForeground(NOTIF_ID, buildNotification()) }
         }
     }
 
     private fun createChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            getSystemService(NotificationManager::class.java).createNotificationChannel(
-                NotificationChannel(CHANNEL_ID, "System Service", NotificationManager.IMPORTANCE_MIN)
-                    .apply {
-                        setShowBadge(false)
-                        setSound(null, null)
-                        enableLights(false)
-                        enableVibration(false)
-                    }
-            )
-        }
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+        getSystemService(NotificationManager::class.java).createNotificationChannel(
+            NotificationChannel(CHANNEL_ID, "System Service", NotificationManager.IMPORTANCE_MIN).apply {
+                setShowBadge(false); setSound(null, null)
+                enableLights(false); enableVibration(false)
+            }
+        )
     }
 
-    private fun buildNotification(): Notification {
-        return NotificationCompat.Builder(this, CHANNEL_ID)
+    private fun buildNotification(): Notification =
+        NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Location Service")
-            .setContentText("Running")
+            .setContentText(if (routeActive) "Маршрут активен" else "Работает")
             .setSmallIcon(android.R.drawable.stat_sys_upload_done)
-            .setOngoing(true)
-            .setSilent(true)
+            .setOngoing(true).setSilent(true)
             .setPriority(NotificationCompat.PRIORITY_MIN)
             .setVisibility(NotificationCompat.VISIBILITY_SECRET)
             .build()
-    }
 
-    private fun updateNotification() {
-        getSystemService(NotificationManager::class.java).notify(NOTIF_ID, buildNotification())
-    }
+    // ── Companion ──────────────────────────────────────────────────────────
 
     companion object {
         private const val TAG = "GpsEmu"
@@ -280,20 +382,19 @@ class MockLocationService : Service() {
         private const val EMIT_INTERVAL_MS = 200L
         private const val BURST_COUNT = 8
         private const val BURST_INTERVAL_MS = 50L
+        private const val GLOBAL_WRITE_THROTTLE_MS = 300L  // limit Settings.Global IPC during route
 
-        const val ACTION_STOP = "com.gpsemu.STOP"
+        const val ACTION_STOP        = "com.gpsemu.STOP"
+        const val ACTION_PAUSE       = "com.gpsemu.PAUSE"
+        const val ACTION_RESUME      = "com.gpsemu.RESUME"
+        const val ACTION_START_ROUTE = "com.gpsemu.START_ROUTE"
+        const val EXTRA_WAYPOINTS_JSON = "waypoints_json"
+        const val EXTRA_SPEED_KMH      = "speed_kmh"
+        const val EXTRA_TIME_SEC       = "time_sec"
+        const val EXTRA_LOOP           = "loop"
         const val PREFS_NAME = "gps_emu_prefs"
 
-        /**
-         * "fused" is where most modern apps actually read from — Play Services'
-         * FusedLocationProviderClient and, since Android 12, LocationManager.FUSED_PROVIDER.
-         * The constant is @hide on older releases, so it is spelled out. Feeding only
-         * gps and network leaves those apps on a stale position.
-         *
-         * Registering it can fail depending on the ROM; [registerProviders] tolerates that.
-         */
         private const val FUSED_PROVIDER = "fused"
-
         private val PROVIDERS = listOf(
             LocationManager.GPS_PROVIDER,
             LocationManager.NETWORK_PROVIDER,
@@ -301,15 +402,32 @@ class MockLocationService : Service() {
         )
 
         fun start(ctx: Context, point: GeoPoint) {
+            ctx.startForegroundService(point.putInto(Intent(ctx, MockLocationService::class.java)))
+        }
+
+        fun startRoute(ctx: Context, waypoints: List<GeoPoint>, speedKmh: Float, timeSec: Int, loop: Boolean) {
+            val json = JSONArray().apply {
+                waypoints.forEach { pt ->
+                    put(JSONObject().put("lat", pt.latitude).put("lon", pt.longitude).put("alt", pt.altitude))
+                }
+            }.toString()
             ctx.startForegroundService(
-                point.putInto(Intent(ctx, MockLocationService::class.java))
+                Intent(ctx, MockLocationService::class.java)
+                    .setAction(ACTION_START_ROUTE)
+                    .putExtra(EXTRA_WAYPOINTS_JSON, json)
+                    .putExtra(EXTRA_SPEED_KMH, speedKmh)
+                    .putExtra(EXTRA_TIME_SEC, timeSec)
+                    .putExtra(EXTRA_LOOP, loop)
             )
         }
 
-        fun stop(ctx: Context) {
-            ctx.startService(
-                Intent(ctx, MockLocationService::class.java).setAction(ACTION_STOP)
-            )
-        }
+        fun stop(ctx: Context) =
+            ctx.startService(Intent(ctx, MockLocationService::class.java).setAction(ACTION_STOP))
+
+        fun pause(ctx: Context) =
+            ctx.startService(Intent(ctx, MockLocationService::class.java).setAction(ACTION_PAUSE))
+
+        fun resume(ctx: Context) =
+            ctx.startService(Intent(ctx, MockLocationService::class.java).setAction(ACTION_RESUME))
     }
 }
