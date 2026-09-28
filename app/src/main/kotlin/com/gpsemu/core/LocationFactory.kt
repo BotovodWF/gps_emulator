@@ -23,7 +23,8 @@ object LocationFactory {
             altitude = point.altitude
             accuracy = gaussianAccuracy()
             speed = speedMps
-            bearing = point.bearing
+            // Bearing is only meaningful when moving; zero-speed bearing confuses some nav apps
+            bearing = if (speedMps > 0.1f) point.bearing else 0f
             time = System.currentTimeMillis()
             elapsedRealtimeNanos = SystemClock.elapsedRealtimeNanos()
 
